@@ -1,5 +1,11 @@
 # ryzer
 
+## 1.0.2
+
+### Patch Changes
+
+- 36071c9: Read the CLI version from the package manifest so Changesets releases always report the published version.
+
 ## 1.0.1
 
 ### Patch Changes
