@@ -1,5 +1,11 @@
 # ryzer
 
+## 1.0.1
+
+### Patch Changes
+
+- 155ab0e: Stabilize SPA navigation boundaries by retrying Chrome's explicit aborted-navigation signal and locator evaluation across execution-realm replacement.
+
 ## 1.0.0
 
 ### Major Changes
