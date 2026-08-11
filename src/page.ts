@@ -217,6 +217,7 @@ export class Page {
     const resolved = this.baseURL ? new URL(url, this.baseURL).href : url;
     const waitUntil = options.waitUntil ?? "load";
     const timeoutMs = options.timeoutMs ?? this.defaultNavigationTimeoutMs;
+    const deadline = performance.now() + timeoutMs;
     if (waitUntil === "networkidle") await this.#enableNetwork();
     const desiredLifecycle = waitUntil === "domcontentloaded" ? "DOMContentLoaded" : "load";
     const seen = new Set<string>();
@@ -233,24 +234,31 @@ export class Page {
         if (expectedLoader === event.loaderId) lifecycleResolve?.();
       },
     );
-    const result = await this.session.send<{ errorText?: string; loaderId?: string }>(
-      "Page.navigate",
-      { url: resolved },
-    );
-    if (result.errorText) throw new Error(`Navigation to ${resolved} failed: ${result.errorText}`);
-    expectedLoader = result.loaderId;
-    if (expectedLoader && seen.has(expectedLoader)) lifecycleResolve?.();
-    if (waitUntil !== "commit" && expectedLoader) {
-      try {
+    try {
+      let result: { errorText?: string; loaderId?: string } | undefined;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        result = await this.session.send<{ errorText?: string; loaderId?: string }>(
+          "Page.navigate",
+          { url: resolved },
+        );
+        if (result.errorText !== "net::ERR_ABORTED" || performance.now() >= deadline) break;
+        // A still-hydrating SPA can briefly supersede CDP's navigation. Retry
+        // only Chrome's explicit abort signal; DNS, TLS, and HTTP failures
+        // remain fail-fast.
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 10 * (attempt + 1)));
+      }
+      if (result?.errorText)
+        throw new Error(`Navigation to ${resolved} failed: ${result.errorText}`);
+      expectedLoader = result?.loaderId;
+      if (expectedLoader && seen.has(expectedLoader)) lifecycleResolve?.();
+      if (waitUntil !== "commit" && expectedLoader) {
         await withTimeout(
           lifecycle,
-          timeoutMs,
+          Math.max(1, deadline - performance.now()),
           `Navigation to ${resolved} timed out waiting for ${waitUntil}`,
         );
-      } finally {
-        disposeLifecycle();
       }
-    } else {
+    } finally {
       disposeLifecycle();
     }
     if (waitUntil === "networkidle") await this.waitForNetworkIdle({ timeoutMs });
