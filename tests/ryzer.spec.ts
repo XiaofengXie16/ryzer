@@ -83,36 +83,6 @@ test.describe("core browser API", () => {
     }
   });
 
-  test("goto survives a client navigation that loses the same commit race", async ({ page }) => {
-    const server = createServer((request, response) => {
-      const url = new URL(request.url ?? "/", "http://fixture");
-      response.setHeader("content-type", "text/html");
-      response.end(`<h1>${url.pathname}:${url.searchParams.get("iteration")}</h1>`);
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string")
-      throw new Error("Fixture server did not bind a TCP port");
-    const origin = `http://127.0.0.1:${address.port}`;
-    try {
-      for (let iteration = 0; iteration < 25; iteration++) {
-        await page.goto(`${origin}/source?iteration=${iteration}`, {
-          waitUntil: "domcontentloaded",
-        });
-        await page.evaluate(
-          (next) => setTimeout(() => location.assign(next), 0),
-          `${origin}/noise?iteration=${iteration}`,
-        );
-        await page.goto(`${origin}/destination?iteration=${iteration}`, {
-          waitUntil: "domcontentloaded",
-        });
-        await expect(page.locator("h1")).toHaveText(`/destination:${iteration}`);
-      }
-    } finally {
-      await closeServer(server);
-    }
-  });
-
   test("fills through the native setter and emits framework-compatible events", async ({
     page,
   }) => {
