@@ -499,13 +499,26 @@ export class Page {
     }
     await this.#ensureResetRealm();
     const normalized = serializeLocatorSpec(spec);
-    // _initialize installs the runtime in the current realm and
-    // addScriptToEvaluateOnNewDocument installs it before future page code.
-    // Keep the hot command tiny instead of retransmitting ~20 KB per action.
-    const expression = `globalThis.__ryzer.run(${serialize(normalized)},${serialize(operation)},${serialize(args)},${timeoutMs})`;
-    const result = await this.#evaluateExpression<RyzerResult<T>>(expression);
-    if (!result.ok) throw new Error(result.error ?? `Locator operation ${operation} failed`);
-    return result.value as T;
+    const deadline = performance.now() + timeoutMs;
+    for (;;) {
+      const remainingMs = Math.max(1, Math.ceil(deadline - performance.now()));
+      // _initialize installs the runtime in the current realm and
+      // addScriptToEvaluateOnNewDocument installs it before future page code.
+      // Keep the hot command tiny instead of retransmitting ~20 KB per action.
+      const expression = `globalThis.__ryzer.run(${serialize(normalized)},${serialize(operation)},${serialize(args)},${remainingMs})`;
+      try {
+        const result = await this.#evaluateExpression<RyzerResult<T>>(expression);
+        if (!result.ok) throw new Error(result.error ?? `Locator operation ${operation} failed`);
+        return result.value as T;
+      } catch (error) {
+        // A trusted click can replace Chrome's execution realm before the next
+        // assertion reaches it. That is a synchronization boundary, not a test
+        // failure: retry the locator in the new document using the original
+        // timeout budget. Non-navigation errors remain fail-fast.
+        if (!isNavigationRealmRace(error) || performance.now() >= deadline) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
   }
 
   async _runFlow(steps: readonly FlowStep[], timeoutMs = this.defaultTimeoutMs): Promise<void> {
@@ -755,6 +768,13 @@ async function writeBuffer(path: string, buffer: Buffer): Promise<void> {
   const { dirname } = await import("node:path");
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, buffer);
+}
+
+function isNavigationRealmRace(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /(?:Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id)/i.test(
+    error.message,
+  );
 }
 
 function matchesURL(pattern: string | RegExp, url: string): boolean {

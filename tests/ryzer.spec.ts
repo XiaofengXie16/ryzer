@@ -44,6 +44,40 @@ test.describe("core browser API", () => {
     await expect(page.locator("#result")).toHaveText("trusted-click");
   });
 
+  test("locator assertions cross a navigation realm without a retry", async ({ page }) => {
+    const server = createServer((request, response) => {
+      const url = new URL(request.url ?? "/", "http://fixture");
+      response.setHeader("content-type", "text/html");
+      if (url.pathname === "/next") {
+        response.flushHeaders();
+        setTimeout(
+          () => response.end(`<h1>Destination ${url.searchParams.get("iteration")}</h1>`),
+          5,
+        );
+        return;
+      }
+      response.end(
+        `<a id="next" href="/next?iteration=${url.searchParams.get("iteration")}">Next</a>`,
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("Fixture server did not bind a TCP port");
+    const origin = `http://127.0.0.1:${address.port}`;
+    try {
+      for (let iteration = 0; iteration < 25; iteration++) {
+        await page.goto(`${origin}/?iteration=${iteration}`, { waitUntil: "domcontentloaded" });
+        await page.locator("#next").click();
+        await expect(page.locator("h1")).toHaveText(`Destination ${iteration}`);
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
   test("fills through the native setter and emits framework-compatible events", async ({
     page,
   }) => {
