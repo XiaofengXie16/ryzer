@@ -7,12 +7,13 @@ import { tsImport } from "tsx/esm/api";
 
 import { runTests } from "./runner.js";
 import type { RunnerConfig } from "./types.js";
+import { packageVersion } from "./version.js";
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args[0] === "--help" || args[0] === "help") return help();
   if (args[0] === "--version" || args[0] === "version") {
-    process.stdout.write("1.0.0\n");
+    process.stdout.write(`${packageVersion()}\n`);
     return;
   }
   const command = args[0] && !args[0].startsWith("-") ? args.shift() : "test";
