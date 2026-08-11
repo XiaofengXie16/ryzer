@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate Rust daemon
+        run: |
+          cargo fmt --manifest-path native/ryzerd/Cargo.toml -- --check
+          cargo clippy --manifest-path native/ryzerd/Cargo.toml -- -D warnings
+          cargo build --release --manifest-path native/ryzerd/Cargo.toml
+          install -m 755 native/ryzerd/target/release/ryzerd native/bin/ryzerd-linux-x64
+
+      - name: Check formatting, lint, and types
+        run: npm run check
+
+      - name: Build package
+        run: npm run build
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+      - name: Run browser regressions
+        run: npm test
+
+      - name: Inspect package manifest
+        run: npm pack --dry-run
