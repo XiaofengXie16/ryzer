@@ -2,6 +2,13 @@ import { createServer } from "node:http";
 
 import { expect, test } from "../src/index.js";
 
+async function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+    server.closeAllConnections();
+  });
+}
+
 function pageUrl(body: string, script = ""): string {
   const html = `<!doctype html><html><head><title>Ryzer fixture</title></head><body>${body}<script>${script}</script></body></html>`;
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
@@ -72,9 +79,7 @@ test.describe("core browser API", () => {
         await expect(page.locator("h1")).toHaveText(`Destination ${iteration}`);
       }
     } finally {
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve())),
-      );
+      await closeServer(server);
     }
   });
 
@@ -104,9 +109,7 @@ test.describe("core browser API", () => {
         await expect(page.locator("h1")).toHaveText(`/destination:${iteration}`);
       }
     } finally {
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve())),
-      );
+      await closeServer(server);
     }
   });
 
@@ -211,9 +214,7 @@ test("intercepts requests and clears routes at the reset boundary", async ({ pag
     await page.locator("#load").click();
     await expect(page.locator("#result")).toHaveText("real");
   } finally {
-    await new Promise<void>((resolve, reject) =>
-      server.close((error) => (error ? reject(error) : resolve())),
-    );
+    await closeServer(server);
   }
 });
 
