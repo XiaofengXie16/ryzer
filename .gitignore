@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.ryzer/
+ryzer-results/
+latch-results/
+test-results/
+benchmark-results/
+work/
+outputs/
+native/ryzerd/target/
+.DS_Store
+*.log

@@ -1,0 +1,74 @@
+{
+  "name": "ryzer",
+  "version": "1.0.0",
+  "description": "A fast, deterministic browser test runner with a TypeScript-first API",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XiaofengXie16/ryzer.git"
+  },
+  "homepage": "https://github.com/XiaofengXie16/ryzer#readme",
+  "bugs": {
+    "url": "https://github.com/XiaofengXie16/ryzer/issues"
+  },
+  "type": "module",
+  "bin": {
+    "ryzer": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "native/bin",
+    "README.md",
+    "ARCHITECTURE.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "oxlint -D correctness --max-warnings 0 src tests benchmarks",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "check": "npm run format:check && npm run lint && npm run typecheck",
+    "test": "tsx src/cli.ts test tests",
+    "test:unit": "tsx --test tests/unit/**/*.unit.ts",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "npm run build && changeset publish",
+    "bench": "tsx benchmarks/run.ts",
+    "bench:overhead": "tsx benchmarks/overhead.ts",
+    "bench:flow": "tsx benchmarks/flow.ts",
+    "bench:deterministic": "tsx benchmarks/deterministic.ts",
+    "bench:flow-stability": "tsx benchmarks/deterministic-stability.ts",
+    "bench:large-dom": "tsx benchmarks/large-dom.ts",
+    "bench:stability": "tsx benchmarks/stability.ts",
+    "bench:incremental": "tsx benchmarks/incremental.ts",
+    "prepack": "npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "tsx": "^4.20.3",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.31.1",
+    "@playwright/test": "1.62.1",
+    "@types/node": "^22.15.30",
+    "@types/ws": "^8.18.1",
+    "oxfmt": "^0.63.0",
+    "oxlint": "^1.78.0",
+    "typescript": "^5.8.3"
+  },
+  "license": "MIT"
+}
