@@ -138,8 +138,9 @@ fn run_fingerprint(args: &[String]) -> Result<(), String> {
     }
     let root = root.ok_or("fingerprint requires --root")?;
     let root = fs::canonicalize(&root).map_err(|error| format!("fingerprint root: {error}"))?;
-    let mut entries = Vec::new();
-    fingerprint_directory(&root, &root, &excludes, &mut entries)?;
+    let mut pending = Vec::new();
+    fingerprint_directory(&root, &root, &excludes, &mut pending)?;
+    let mut entries = hash_entries(pending)?;
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -154,11 +155,67 @@ fn run_fingerprint(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// A walked entry whose content has not been hashed yet. Hashing is the only
+/// expensive part and it is embarrassingly parallel, so the walk records what
+/// to hash and `hash_entries` fans the work across the available cores.
+struct PendingEntry {
+    relative: String,
+    path: PathBuf,
+    size: u64,
+    modified: u128,
+    symlink_target: Option<PathBuf>,
+}
+
+type FingerprintRow = (String, u64, u128, String);
+type HashedSlot = Mutex<Option<Result<FingerprintRow, String>>>;
+
+fn hash_entries(pending: Vec<PendingEntry>) -> Result<Vec<FingerprintRow>, String> {
+    let threads = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .min(pending.len().max(1));
+    if threads <= 1 {
+        return pending.iter().map(hash_one_ref).collect();
+    }
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<HashedSlot> = pending.iter().map(|_| Mutex::new(None)).collect();
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let index = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(entry) = pending.get(index) else {
+                    return;
+                };
+                let hashed = hash_one_ref(entry);
+                if let Ok(mut slot) = results[index].lock() {
+                    *slot = Some(hashed);
+                }
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .map_err(|_| "fingerprint result lock poisoned".to_string())?
+                .ok_or_else(|| "fingerprint worker produced no result".to_string())?
+        })
+        .collect()
+}
+
+fn hash_one_ref(entry: &PendingEntry) -> Result<FingerprintRow, String> {
+    let hash = match &entry.symlink_target {
+        Some(target) => hash_symlink(&entry.path, target)?,
+        None => hash_file(&entry.path)?,
+    };
+    Ok((entry.relative.clone(), entry.size, entry.modified, hash))
+}
+
 fn fingerprint_directory(
     root: &Path,
     directory: &Path,
     excludes: &[PathBuf],
-    entries: &mut Vec<(String, u64, u128, String)>,
+    entries: &mut Vec<PendingEntry>,
 ) -> Result<(), String> {
     let children = fs::read_dir(directory)
         .map_err(|error| format!("read directory {}: {error}", directory.display()))?;
@@ -188,12 +245,13 @@ fn fingerprint_directory(
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_nanos())
                 .unwrap_or_default();
-            entries.push((
-                relative.to_string_lossy().replace('\\', "/"),
-                metadata.len(),
+            entries.push(PendingEntry {
+                relative: relative.to_string_lossy().replace('\\', "/"),
+                size: metadata.len(),
                 modified,
-                hash_symlink(&path, &target)?,
-            ));
+                path,
+                symlink_target: Some(target),
+            });
             continue;
         }
         if file_type.is_dir() {
@@ -212,12 +270,13 @@ fn fingerprint_directory(
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        entries.push((
-            relative.to_string_lossy().replace('\\', "/"),
-            metadata.len(),
+        entries.push(PendingEntry {
+            relative: relative.to_string_lossy().replace('\\', "/"),
+            size: metadata.len(),
             modified,
-            hash_file(&path)?,
-        ));
+            path,
+            symlink_target: None,
+        });
     }
     Ok(())
 }
