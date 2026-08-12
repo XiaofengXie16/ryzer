@@ -2,7 +2,7 @@
 "ryzer": patch
 ---
 
-Pay Chrome's renderer fork between runs instead of during them. The fork is ~185ms and was the largest single item in a warm run; it cannot be overlapped with test execution because Chrome serializes it against the browser it belongs to. A detached warmer now leaves one context per browser with its renderer already forked, and the next run adopts it in milliseconds. The warmer holds a real lease that the daemon grants only when the pool is fully idle, so it never delays a run or grows the pool.
+Pay Chrome's renderer fork between runs instead of during them, on platforms where it is expensive. Chrome forks renderers from a zygote on Linux and has none on macOS: the first renderer-bound command on a fresh context measures 12-24ms on Linux and 180-227ms on macOS. Where it is costly, a detached warmer now leaves one context per browser with its renderer already forked and the next run adopts it in milliseconds. The warmer holds a real lease that the daemon grants only when the pool is fully idle, so it never delays a run or grows the pool. Measured on a 12-file suite: macOS 2.254s to 0.459s. Gated to macOS because the same A/B on Linux was a loss.
 
 Load TypeScript test files through Node's own type stripper instead of esbuild. The previous fast-lane check rejected any file containing a relative import, which excluded essentially every real spec file; a resolve hook now maps `./foo.js` onto `./foo.ts` so only non-erasable syntax falls back to `tsx`. Measured 296ms to 33ms for twelve spec files importing shared helpers.
 
