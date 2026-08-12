@@ -71,11 +71,19 @@ function waitForWebSocket(
   });
 }
 
+interface TargetInfo {
+  targetId: string;
+  type: string;
+  url: string;
+  browserContextId?: string;
+}
+
 export class Browser {
   #closed = false;
   #contexts = new Set<BrowserContext>();
   #sessionsByTarget = new Map<string, string>();
   #sessionWaiters = new Map<string, (sessionId: string) => void>();
+  #warmAdoptTried = false;
 
   private constructor(
     readonly connection: CdpConnection,
@@ -178,6 +186,77 @@ export class Browser {
     return await context.newPage();
   }
 
+  /** Creates a context and page and forces Chrome to fork the renderer for it.
+   * Called by the detached warmer after a run exits, never on a critical path:
+   * within one browser this fork blocks whatever else that browser is doing. */
+  async _parkWarmContext(): Promise<void> {
+    const { browserContextId } = await this.connection.send<{ browserContextId: string }>(
+      "Target.createBrowserContext",
+      { disposeOnDetach: false },
+    );
+    const { targetId } = await this.connection.send<{ targetId: string }>("Target.createTarget", {
+      url: "about:blank",
+      browserContextId,
+    });
+    const sessionId = await this._sessionForTarget(targetId);
+    await new CdpSession(this.connection, sessionId).send("Page.getFrameTree", {});
+  }
+
+  /** Whether a context is already parked here, so the warmer can stay additive
+   * and still bound itself to one parked context per browser. */
+  async _hasParkedContext(): Promise<boolean> {
+    const { targetInfos } = await this.connection.send<{ targetInfos: TargetInfo[] }>(
+      "Target.getTargets",
+      {},
+    );
+    return targetInfos.some(
+      (target) => target.type === "page" && target.url === "about:blank" && target.browserContextId,
+    );
+  }
+
+  /** Adopts a context parked by the warmer after the previous run. Creating a
+   * context, its target, and waiting for Chrome to fork the renderer costs
+   * roughly 250ms; adopting one costs single-digit milliseconds. */
+  async _adoptWarmContext(
+    options: PageOptions,
+  ): Promise<{ context: BrowserContext; page: Page } | undefined> {
+    // Only one context is ever parked, so a second lookup spends a round trip
+    // to learn nothing.
+    if (this.#closed || this.#warmAdoptTried) return undefined;
+    this.#warmAdoptTried = true;
+    let targetInfos: TargetInfo[];
+    try {
+      ({ targetInfos } = await this.connection.send<{ targetInfos: TargetInfo[] }>(
+        "Target.getTargets",
+        {},
+      ));
+    } catch {
+      return undefined;
+    }
+    const pages = targetInfos.filter(
+      (target): target is TargetInfo & { browserContextId: string } =>
+        target.type === "page" && Boolean(target.browserContextId),
+    );
+    // A parked context is always left at about:blank. Anything else in this
+    // exclusively leased browser is debris from a run that died before cleanup.
+    const warm = pages.find((target) => target.url === "about:blank");
+    for (const id of new Set(pages.map((target) => target.browserContextId))) {
+      if (id === warm?.browserContextId) continue;
+      void this.connection
+        .send("Target.disposeBrowserContext", { browserContextId: id })
+        .catch(() => undefined);
+    }
+    if (!warm) return undefined;
+    const context = new BrowserContext(this, warm.browserContextId, options);
+    this.#contexts.add(context);
+    try {
+      return { context, page: await context._adoptPage(warm.targetId) };
+    } catch {
+      await context.close().catch(() => undefined);
+      return undefined;
+    }
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
@@ -248,6 +327,24 @@ export class BrowserContext {
       },
     );
     const sessionId = await this.browser._sessionForTarget(targetId);
+    const page = new Page(
+      this,
+      targetId,
+      new CdpSession(this.browser.connection, sessionId),
+      this.options,
+    );
+    await page._initialize();
+    this.#pages.add(page);
+    return page;
+  }
+
+  /** Attaches to a target that existed before this connection, so auto-attach
+   * never announced it. */
+  async _adoptPage(targetId: string): Promise<Page> {
+    const { sessionId } = await this.browser.connection.send<{ sessionId: string }>(
+      "Target.attachToTarget",
+      { targetId, flatten: true },
+    );
     const page = new Page(
       this,
       targetId,

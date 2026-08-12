@@ -3,8 +3,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { tsImport } from "tsx/esm/api";
-
+import { importTypeScript } from "./loader.js";
 import { runTests } from "./runner.js";
 import type { RunnerConfig } from "./types.js";
 import { packageVersion } from "./version.js";
@@ -76,7 +75,7 @@ async function loadConfig(explicit?: string): Promise<RunnerConfig> {
       );
   const path = candidates.find(existsSync);
   if (!path) return {};
-  const module = (await tsImport(pathToFileURL(path).href, import.meta.url)) as {
+  const module = (await importTypeScript(pathToFileURL(path).href)) as {
     default?: RunnerConfig;
   };
   return module.default ?? {};

@@ -187,7 +187,7 @@ Do not exclude application code, fixtures, lockfiles, or build output loaded by 
 - Locator queries use native candidate selectors and a realm-local open-shadow topology rather than walking every element for every operation.
 - One realm-level mutation observer wakes active waits without constructing a new observer per instruction.
 - The default scheduler uses measured adaptive concurrency: roughly two tests per worker, capped at eight and the available CPU count.
-- On Node versions with stable type stripping, compatible TypeScript test files use the native loader; relative-source and non-erasable syntax conservatively fall back to `tsx`.
+- On Node versions with stable type stripping, TypeScript test files use Node's own loader; only non-erasable syntax (parameter properties, `enum`, `namespace`, `import =`) falls back to `tsx`. A resolve hook maps a relative `./foo.js` specifier onto `./foo.ts` when that source exists, matching how `tsx` resolves. In a project that keeps compiled output beside its sources, a relative import of `./foo.js` therefore loads `foo.ts` rather than the emitted `foo.js`.
 - The native SHA-256 planner runs before test loading. An exact complete-run hit bypasses TypeScript loading and Chrome entirely.
 - Partial hits close over shared module dependencies, then size the browser-worker pool to the affected work instead of the original suite size.
 

@@ -1,9 +1,9 @@
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { basename, extname, join, relative, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
-
-import { tsImport } from "tsx/esm/api";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { Browser } from "./browser.js";
 import {
@@ -13,8 +13,10 @@ import {
   type CapsuleObservation,
   type CapsuleStats,
 } from "./capsule.js";
+import { importTypeScript } from "./loader.js";
 import { acquireNativePool, type NativePoolLease } from "./native.js";
 import { _registeredTests, _resetRegistry, _setCurrentFile, type RegisteredTest } from "./test.js";
+import { trace } from "./trace.js";
 import type { RunnerConfig, TestFixtures } from "./types.js";
 
 export interface TestAttempt {
@@ -47,12 +49,14 @@ export async function runTests(
   config: RunnerConfig = {},
   explicitPaths: string[] = [],
 ): Promise<RunSummary> {
+  trace("runTests:enter");
   const started = performance.now();
   const startedAt = new Date().toISOString();
   const outputDir = resolve(config.outputDir ?? "ryzer-results");
   const capsulePreflight = config.incremental
     ? await prepareCapsule(config, explicitPaths)
     : undefined;
+  if (config.incremental) trace("capsule:preflight");
   const completeReplay = capsulePreflight ? replayCompleteCapsule(capsulePreflight) : undefined;
   if (completeReplay) {
     const results: TestResult[] = completeReplay.results.map((result) => ({
@@ -85,11 +89,13 @@ export async function runTests(
     config.match,
   );
   if (files.length === 0) throw new Error("No test files found");
+  trace("discover:done", `${files.length} file(s)`);
   _resetRegistry();
   for (const file of files) {
     _setCurrentFile(file);
     await importTestFile(file);
   }
+  trace("import:done");
   const registered = _registeredTests();
   const hasOnly = registered.some((item) => item.only);
   const tests = registered.filter((item) => !hasOnly || item.only);
@@ -153,7 +159,9 @@ export async function runTests(
   // many workers serializes target creation, navigation, and renderer work.
   // Launching one lightweight headless browser per worker is measurably faster
   // and also contains process crashes to a single worker.
+  trace("workers:launch-start", `${concurrency} worker(s)`);
   const fleet = await launchWorkers(concurrency, config);
+  trace("workers:ready", fleet.nativeUsed ? "native-pool" : "direct");
   const { browsers } = fleet;
   let cursor = 0;
   try {
@@ -180,6 +188,7 @@ export async function runTests(
             () => fleet.recover(workerIndex),
             () => cursor < activeIndices.length,
             Boolean(capsule),
+            fleet.nativeUsed && warmingPaysOffHere(),
           );
           browser = execution.browser;
           reusable = execution.reusable;
@@ -194,6 +203,11 @@ export async function runTests(
     await Promise.all(workers);
   } finally {
     await Promise.allSettled(browsers.map((browser) => browser.close()));
+    // Hand the renderer forks for the next run to a detached process. Doing
+    // this in-process is measurably pointless: Chrome serializes the fork
+    // against the browser it belongs to, so it can be moved but never
+    // overlapped with work this process still has to do.
+    spawnWarmer(fleet, config);
     for (const lease of fleet.leases) lease.release();
   }
   capsule?.finalize(tests, results);
@@ -212,34 +226,7 @@ export async function runTests(
 }
 
 async function importTestFile(file: string): Promise<void> {
-  const url = `${pathToFileURL(file).href}?ryzer=${Date.now()}`;
-  if (await canUseNativeTypeScript(file)) {
-    try {
-      await import(url);
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX")
-        throw error;
-    }
-  }
-  await tsImport(url, import.meta.url);
-}
-
-async function canUseNativeTypeScript(file: string): Promise<boolean> {
-  if (!file.endsWith(".ts") && !file.endsWith(".mts")) return false;
-  if ((process.features as unknown as { typescript?: string }).typescript !== "strip") return false;
-  const source = await readFile(file, "utf8");
-  // Native Node resolution does not map a relative .js specifier back to a
-  // TypeScript source file like tsx does. Keep the fast lane conservative.
-  if (/\b(?:from|import)\s*\(?\s*["'](?:\.|\/|file:)/.test(source)) return false;
-  // These constructs require Node's opt-in transform mode. Erasable syntax
-  // (types, interfaces, generics, `as`, and `satisfies`) stays on the native
-  // strip-only fast path.
-  if (/\b(?:enum|namespace)\s+[A-Za-z_$]/.test(source)) return false;
-  if (/\b(?:import|export)\s*=/.test(source)) return false;
-  if (/constructor\s*\([^)]*\b(?:public|private|protected|readonly)\s+[A-Za-z_$]/s.test(source))
-    return false;
-  return true;
+  await importTypeScript(`${pathToFileURL(file).href}?ryzer=${Date.now()}`);
 }
 
 interface WorkerFleet {
@@ -247,6 +234,52 @@ interface WorkerFleet {
   leases: NativePoolLease[];
   nativeUsed: boolean;
   recover(index: number): Promise<Browser>;
+}
+
+/** Whether pre-forking a renderer is worth a detached process and a parked
+ * renderer per browser.
+ *
+ * Only where Chrome has no zygote. Linux forks renderers from one, and the
+ * first renderer-bound command on a fresh context measures 12-24ms there;
+ * macOS has no zygote and the same command measures 180-227ms. Matching
+ * end-to-end A/Bs on a 12-file suite: macOS 2.232s to 0.881s, Linux a wash
+ * (0.398s without, 0.504s with, both medians) because back-to-back runs let
+ * the warmer contend for a saving that was never large enough to matter.
+ *
+ * RYZER_WARM=1 forces it on for measuring this again on another platform. */
+function warmingPaysOffHere(): boolean {
+  if (process.env.RYZER_WARM === "1") return true;
+  return process.platform === "darwin";
+}
+
+/** Leaves a warm context in daemon-owned browsers for the next run. The child
+ * is detached and unref'd so it cannot delay this process's exit, and it takes
+ * its own lease rather than reusing these endpoints, which this process no
+ * longer owns. */
+function spawnWarmer(fleet: WorkerFleet, config: RunnerConfig): void {
+  if (!fleet.nativeUsed || process.env.RYZER_NO_WARM === "1") return;
+  if (!warmingPaysOffHere()) return;
+  const count = fleet.browsers.length;
+  if (count === 0) return;
+  try {
+    // Running from dist this is warm.js; running the TypeScript sources through
+    // tsx it is warm.ts, which needs the same loader this process was started
+    // with rather than a bare node.
+    const compiled = fileURLToPath(new URL("warm.js", import.meta.url));
+    const source = fileURLToPath(new URL("warm.ts", import.meta.url));
+    const entry = existsSync(compiled) ? compiled : existsSync(source) ? source : undefined;
+    if (!entry) return;
+    const child = spawn(
+      process.execPath,
+      [...process.execArgv, entry, String(count), config.executablePath ?? ""],
+      { detached: true, stdio: "ignore" },
+    );
+    child.once("error", () => undefined);
+    child.unref();
+    trace("warmer:spawned", `${count} browser(s)`);
+  } catch {
+    // Warming is an optimization; failing to start it must never fail a run.
+  }
 }
 
 async function launchWorkers(count: number, config: RunnerConfig): Promise<WorkerFleet> {
@@ -317,6 +350,7 @@ async function executeTest(
   recoverBrowser?: () => Promise<Browser>,
   shouldPrepareNext?: () => boolean,
   observeCapsule = false,
+  allowWarmAdoption = false,
 ): Promise<{
   result: TestResult;
   reusable?: PreparedFixture;
@@ -335,7 +369,7 @@ async function executeTest(
     }
     let fixture: PreparedFixture;
     try {
-      fixture = reusable ?? (await prepareFixture(browser, config));
+      fixture = reusable ?? (await prepareFixture(browser, config, allowWarmAdoption));
     } catch (caught) {
       const error = formatError(caught);
       attempts.push({ attempt, durationMs: performance.now() - attemptStarted, error });
@@ -479,10 +513,22 @@ interface PreparedFixture {
   page: Awaited<ReturnType<Awaited<ReturnType<Browser["newContext"]>>["newPage"]>>;
 }
 
-async function prepareFixture(browser: Browser, config: RunnerConfig): Promise<PreparedFixture> {
+async function prepareFixture(
+  browser: Browser,
+  config: RunnerConfig,
+  allowWarmAdoption = false,
+): Promise<PreparedFixture> {
+  if (allowWarmAdoption && process.env.RYZER_NO_WARM !== "1") {
+    const adopted = await browser._adoptWarmContext(config);
+    if (adopted) {
+      trace("fixture:ready", "adopted");
+      return adopted;
+    }
+  }
   const context = await browser.newContext(config);
   try {
     const page = await context.newPage();
+    trace("fixture:ready", "created");
     return { context, page };
   } catch (error) {
     await context.close();

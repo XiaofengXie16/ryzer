@@ -82,6 +82,29 @@ impl Pool {
         Ok(leases)
     }
 
+    /// Leases idle slots for the warmer, launching nothing and never waiting.
+    ///
+    /// Returns nothing at all while any lease is outstanding. A warm context is
+    /// worth having, but taking a browser that a live run is about to ask for
+    /// makes that run launch its own Chrome instead, and a machine already
+    /// running tests is the worst possible moment to add browser processes.
+    /// Requiring a fully idle pool keeps warming strictly off everyone's path.
+    fn acquire_free(&mut self, count: usize) -> Vec<(u64, String)> {
+        self.last_activity = Instant::now();
+        self.slots.retain_mut(|slot| slot.leased || slot.alive());
+        if self.has_leases() {
+            return Vec::new();
+        }
+        let mut leases = Vec::new();
+        for slot in &mut self.slots {
+            if !slot.leased && leases.len() < count {
+                slot.leased = true;
+                leases.push((slot.id, slot.ws_url.clone()));
+            }
+        }
+        leases
+    }
+
     fn release(&mut self, ids: &[u64]) {
         self.last_activity = Instant::now();
         for slot in &mut self.slots {
@@ -138,8 +161,9 @@ fn run_fingerprint(args: &[String]) -> Result<(), String> {
     }
     let root = root.ok_or("fingerprint requires --root")?;
     let root = fs::canonicalize(&root).map_err(|error| format!("fingerprint root: {error}"))?;
-    let mut entries = Vec::new();
-    fingerprint_directory(&root, &root, &excludes, &mut entries)?;
+    let mut pending = Vec::new();
+    fingerprint_directory(&root, &root, &excludes, &mut pending)?;
+    let mut entries = hash_entries(pending)?;
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -154,11 +178,67 @@ fn run_fingerprint(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// A walked entry whose content has not been hashed yet. Hashing is the only
+/// expensive part and it is embarrassingly parallel, so the walk records what
+/// to hash and `hash_entries` fans the work across the available cores.
+struct PendingEntry {
+    relative: String,
+    path: PathBuf,
+    size: u64,
+    modified: u128,
+    symlink_target: Option<PathBuf>,
+}
+
+type FingerprintRow = (String, u64, u128, String);
+type HashedSlot = Mutex<Option<Result<FingerprintRow, String>>>;
+
+fn hash_entries(pending: Vec<PendingEntry>) -> Result<Vec<FingerprintRow>, String> {
+    let threads = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .min(pending.len().max(1));
+    if threads <= 1 {
+        return pending.iter().map(hash_one_ref).collect();
+    }
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<HashedSlot> = pending.iter().map(|_| Mutex::new(None)).collect();
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let index = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(entry) = pending.get(index) else {
+                    return;
+                };
+                let hashed = hash_one_ref(entry);
+                if let Ok(mut slot) = results[index].lock() {
+                    *slot = Some(hashed);
+                }
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .map_err(|_| "fingerprint result lock poisoned".to_string())?
+                .ok_or_else(|| "fingerprint worker produced no result".to_string())?
+        })
+        .collect()
+}
+
+fn hash_one_ref(entry: &PendingEntry) -> Result<FingerprintRow, String> {
+    let hash = match &entry.symlink_target {
+        Some(target) => hash_symlink(&entry.path, target)?,
+        None => hash_file(&entry.path)?,
+    };
+    Ok((entry.relative.clone(), entry.size, entry.modified, hash))
+}
+
 fn fingerprint_directory(
     root: &Path,
     directory: &Path,
     excludes: &[PathBuf],
-    entries: &mut Vec<(String, u64, u128, String)>,
+    entries: &mut Vec<PendingEntry>,
 ) -> Result<(), String> {
     let children = fs::read_dir(directory)
         .map_err(|error| format!("read directory {}: {error}", directory.display()))?;
@@ -188,12 +268,13 @@ fn fingerprint_directory(
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_nanos())
                 .unwrap_or_default();
-            entries.push((
-                relative.to_string_lossy().replace('\\', "/"),
-                metadata.len(),
+            entries.push(PendingEntry {
+                relative: relative.to_string_lossy().replace('\\', "/"),
+                size: metadata.len(),
                 modified,
-                hash_symlink(&path, &target)?,
-            ));
+                path,
+                symlink_target: Some(target),
+            });
             continue;
         }
         if file_type.is_dir() {
@@ -212,12 +293,13 @@ fn fingerprint_directory(
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        entries.push((
-            relative.to_string_lossy().replace('\\', "/"),
-            metadata.len(),
+        entries.push(PendingEntry {
+            relative: relative.to_string_lossy().replace('\\', "/"),
+            size: metadata.len(),
             modified,
-            hash_file(&path)?,
-        ));
+            path,
+            symlink_target: None,
+        });
     }
     Ok(())
 }
@@ -317,8 +399,14 @@ impl Sha256 {
             self.compress(&block);
             bytes = &bytes[64..];
         }
-        self.block[..bytes.len()].copy_from_slice(bytes);
-        self.block_len = bytes.len();
+        // Only overwrite the buffer when there is something left to buffer. An
+        // unconditional store discards bytes that the partial-block branch
+        // above just accumulated, which silently reduced every multi-update
+        // digest to a function of its length alone.
+        if !bytes.is_empty() {
+            self.block[..bytes.len()].copy_from_slice(bytes);
+            self.block_len = bytes.len();
+        }
     }
 
     fn finish(mut self) -> [u8; 32] {
@@ -399,7 +487,12 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let mut socket_path: Option<PathBuf> = None;
     let mut chrome_path: Option<PathBuf> = None;
-    let mut idle_seconds = 600u64;
+    // A daemon that exits during a coffee break costs the next run a full cold
+    // Chrome launch per worker, measured at roughly 250ms for one slot and
+    // 490ms for four. The parked processes are the same ones the previous run
+    // already held, so a longer window changes how long they persist, not peak
+    // memory. Override with --idle-seconds or RYZER_DAEMON_IDLE_SECONDS.
+    let mut idle_seconds = 3_600u64;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => socket_path = args.next().map(PathBuf::from),
@@ -499,8 +592,9 @@ fn handle_client(mut stream: UnixStream, pool: Arc<Mutex<Pool>>) {
         let _ = writeln!(stream, "PONG\t{VERSION}");
         return;
     }
+    let free_only = line.starts_with("LEASEFREE\t");
     let count = match line
-        .strip_prefix("LEASE\t")
+        .strip_prefix(if free_only { "LEASEFREE\t" } else { "LEASE\t" })
         .and_then(|value| value.parse::<usize>().ok())
     {
         Some(value) if value > 0 && value <= 64 => value,
@@ -509,6 +603,34 @@ fn handle_client(mut stream: UnixStream, pool: Arc<Mutex<Pool>>) {
             return;
         }
     };
+    if free_only {
+        let leases = match pool.lock() {
+            Ok(mut value) => value.acquire_free(count),
+            Err(_) => return,
+        };
+        let payload = leases
+            .iter()
+            .map(|(id, url)| format!("{id}={url}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if writeln!(stream, "OK\t{payload}").is_err() {
+            if let Ok(mut pool) = pool.lock() {
+                pool.release(&leases.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+            }
+            return;
+        }
+        let mut buffer = [0u8; 64];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        if let Ok(mut pool) = pool.lock() {
+            pool.release(&leases.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+        }
+        return;
+    }
     let leases = {
         let mut pool = match pool.lock() {
             Ok(value) => value,
@@ -619,4 +741,63 @@ fn launch_chrome(chrome: &Path, id: u64) -> Result<BrowserSlot, String> {
         profile,
         leased: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{digest_hex, Sha256};
+
+    fn hash(chunks: &[&[u8]]) -> String {
+        let mut hash = Sha256::new();
+        for chunk in chunks {
+            hash.update(chunk);
+        }
+        digest_hex(hash.finish())
+    }
+
+    #[test]
+    fn matches_known_vectors_in_one_update() {
+        assert_eq!(
+            hash(&[b""]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hash(&[b"abc"]),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// A partial block followed by more data must not lose the buffered bytes.
+    /// This is the shape `hash_symlink` uses, and getting it wrong made every
+    /// same-length symlink target collide.
+    #[test]
+    fn split_updates_match_a_single_update() {
+        let message = b"symlink\0/nonexistent";
+        let whole = hash(&[message]);
+        for split in 0..message.len() {
+            let (left, right) = message.split_at(split);
+            assert_eq!(hash(&[left, right]), whole, "split at {split}");
+        }
+        assert_eq!(
+            whole,
+            "8190a2f3ba2a33c408fb08e930ee5201c4313cd5c2e322a7928dc30838179835"
+        );
+    }
+
+    #[test]
+    fn many_small_updates_match_one_large_update() {
+        let message: Vec<u8> = (0..500u32).map(|index| (index % 251) as u8).collect();
+        let whole = hash(&[&message]);
+        let chunked: Vec<&[u8]> = message.chunks(7).collect();
+        assert_eq!(hash(&chunked), whole);
+    }
+
+    /// Distinct targets of equal length must produce distinct digests.
+    #[test]
+    fn equal_length_messages_do_not_collide() {
+        assert_ne!(
+            hash(&[b"symlink\0", b"/nonexistent"]),
+            hash(&[b"symlink\0", b"/XXXXXXXXXXX"])
+        );
+    }
 }
