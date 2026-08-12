@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { basename, extname, join, relative, resolve } from "node:path";
@@ -244,11 +245,18 @@ function spawnWarmer(fleet: WorkerFleet, config: RunnerConfig): void {
   const count = fleet.browsers.length;
   if (count === 0) return;
   try {
-    const entry = fileURLToPath(new URL("warm.js", import.meta.url));
-    const child = spawn(process.execPath, [entry, String(count), config.executablePath ?? ""], {
-      detached: true,
-      stdio: "ignore",
-    });
+    // Running from dist this is warm.js; running the TypeScript sources through
+    // tsx it is warm.ts, which needs the same loader this process was started
+    // with rather than a bare node.
+    const compiled = fileURLToPath(new URL("warm.js", import.meta.url));
+    const source = fileURLToPath(new URL("warm.ts", import.meta.url));
+    const entry = existsSync(compiled) ? compiled : existsSync(source) ? source : undefined;
+    if (!entry) return;
+    const child = spawn(
+      process.execPath,
+      [...process.execArgv, entry, String(count), config.executablePath ?? ""],
+      { detached: true, stdio: "ignore" },
+    );
     child.once("error", () => undefined);
     child.unref();
     trace("warmer:spawned", `${count} browser(s)`);
