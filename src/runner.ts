@@ -188,7 +188,7 @@ export async function runTests(
             () => fleet.recover(workerIndex),
             () => cursor < activeIndices.length,
             Boolean(capsule),
-            fleet.nativeUsed,
+            fleet.nativeUsed && warmingPaysOffHere(),
           );
           browser = execution.browser;
           reusable = execution.reusable;
@@ -236,12 +236,29 @@ interface WorkerFleet {
   recover(index: number): Promise<Browser>;
 }
 
+/** Whether pre-forking a renderer is worth a detached process and a parked
+ * renderer per browser.
+ *
+ * Only where Chrome has no zygote. Linux forks renderers from one, and the
+ * first renderer-bound command on a fresh context measures 12-24ms there;
+ * macOS has no zygote and the same command measures 180-227ms. Matching
+ * end-to-end A/Bs on a 12-file suite: macOS 2.232s to 0.881s, Linux a wash
+ * (0.398s without, 0.504s with, both medians) because back-to-back runs let
+ * the warmer contend for a saving that was never large enough to matter.
+ *
+ * RYZER_WARM=1 forces it on for measuring this again on another platform. */
+function warmingPaysOffHere(): boolean {
+  if (process.env.RYZER_WARM === "1") return true;
+  return process.platform === "darwin";
+}
+
 /** Leaves a warm context in daemon-owned browsers for the next run. The child
  * is detached and unref'd so it cannot delay this process's exit, and it takes
  * its own lease rather than reusing these endpoints, which this process no
  * longer owns. */
 function spawnWarmer(fleet: WorkerFleet, config: RunnerConfig): void {
   if (!fleet.nativeUsed || process.env.RYZER_NO_WARM === "1") return;
+  if (!warmingPaysOffHere()) return;
   const count = fleet.browsers.length;
   if (count === 0) return;
   try {
