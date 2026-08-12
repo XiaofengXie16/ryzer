@@ -1,9 +1,7 @@
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { basename, extname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-
-import { tsImport } from "tsx/esm/api";
 
 import { Browser } from "./browser.js";
 import {
@@ -13,8 +11,10 @@ import {
   type CapsuleObservation,
   type CapsuleStats,
 } from "./capsule.js";
+import { importTypeScript } from "./loader.js";
 import { acquireNativePool, type NativePoolLease } from "./native.js";
 import { _registeredTests, _resetRegistry, _setCurrentFile, type RegisteredTest } from "./test.js";
+import { trace } from "./trace.js";
 import type { RunnerConfig, TestFixtures } from "./types.js";
 
 export interface TestAttempt {
@@ -47,12 +47,14 @@ export async function runTests(
   config: RunnerConfig = {},
   explicitPaths: string[] = [],
 ): Promise<RunSummary> {
+  trace("runTests:enter");
   const started = performance.now();
   const startedAt = new Date().toISOString();
   const outputDir = resolve(config.outputDir ?? "ryzer-results");
   const capsulePreflight = config.incremental
     ? await prepareCapsule(config, explicitPaths)
     : undefined;
+  if (config.incremental) trace("capsule:preflight");
   const completeReplay = capsulePreflight ? replayCompleteCapsule(capsulePreflight) : undefined;
   if (completeReplay) {
     const results: TestResult[] = completeReplay.results.map((result) => ({
@@ -85,11 +87,13 @@ export async function runTests(
     config.match,
   );
   if (files.length === 0) throw new Error("No test files found");
+  trace("discover:done", `${files.length} file(s)`);
   _resetRegistry();
   for (const file of files) {
     _setCurrentFile(file);
     await importTestFile(file);
   }
+  trace("import:done");
   const registered = _registeredTests();
   const hasOnly = registered.some((item) => item.only);
   const tests = registered.filter((item) => !hasOnly || item.only);
@@ -153,7 +157,9 @@ export async function runTests(
   // many workers serializes target creation, navigation, and renderer work.
   // Launching one lightweight headless browser per worker is measurably faster
   // and also contains process crashes to a single worker.
+  trace("workers:launch-start", `${concurrency} worker(s)`);
   const fleet = await launchWorkers(concurrency, config);
+  trace("workers:ready", fleet.nativeUsed ? "native-pool" : "direct");
   const { browsers } = fleet;
   let cursor = 0;
   try {
@@ -212,34 +218,7 @@ export async function runTests(
 }
 
 async function importTestFile(file: string): Promise<void> {
-  const url = `${pathToFileURL(file).href}?ryzer=${Date.now()}`;
-  if (await canUseNativeTypeScript(file)) {
-    try {
-      await import(url);
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX")
-        throw error;
-    }
-  }
-  await tsImport(url, import.meta.url);
-}
-
-async function canUseNativeTypeScript(file: string): Promise<boolean> {
-  if (!file.endsWith(".ts") && !file.endsWith(".mts")) return false;
-  if ((process.features as unknown as { typescript?: string }).typescript !== "strip") return false;
-  const source = await readFile(file, "utf8");
-  // Native Node resolution does not map a relative .js specifier back to a
-  // TypeScript source file like tsx does. Keep the fast lane conservative.
-  if (/\b(?:from|import)\s*\(?\s*["'](?:\.|\/|file:)/.test(source)) return false;
-  // These constructs require Node's opt-in transform mode. Erasable syntax
-  // (types, interfaces, generics, `as`, and `satisfies`) stays on the native
-  // strip-only fast path.
-  if (/\b(?:enum|namespace)\s+[A-Za-z_$]/.test(source)) return false;
-  if (/\b(?:import|export)\s*=/.test(source)) return false;
-  if (/constructor\s*\([^)]*\b(?:public|private|protected|readonly)\s+[A-Za-z_$]/s.test(source))
-    return false;
-  return true;
+  await importTypeScript(`${pathToFileURL(file).href}?ryzer=${Date.now()}`);
 }
 
 interface WorkerFleet {
@@ -483,6 +462,7 @@ async function prepareFixture(browser: Browser, config: RunnerConfig): Promise<P
   const context = await browser.newContext(config);
   try {
     const page = await context.newPage();
+    trace("fixture:ready");
     return { context, page };
   } catch (error) {
     await context.close();
