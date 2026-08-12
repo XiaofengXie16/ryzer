@@ -1,7 +1,8 @@
+import { spawn } from "node:child_process";
 import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { basename, extname, join, relative, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { Browser } from "./browser.js";
 import {
@@ -186,6 +187,7 @@ export async function runTests(
             () => fleet.recover(workerIndex),
             () => cursor < activeIndices.length,
             Boolean(capsule),
+            fleet.nativeUsed,
           );
           browser = execution.browser;
           reusable = execution.reusable;
@@ -200,6 +202,11 @@ export async function runTests(
     await Promise.all(workers);
   } finally {
     await Promise.allSettled(browsers.map((browser) => browser.close()));
+    // Hand the renderer forks for the next run to a detached process. Doing
+    // this in-process is measurably pointless: Chrome serializes the fork
+    // against the browser it belongs to, so it can be moved but never
+    // overlapped with work this process still has to do.
+    spawnWarmer(fleet, config);
     for (const lease of fleet.leases) lease.release();
   }
   capsule?.finalize(tests, results);
@@ -226,6 +233,28 @@ interface WorkerFleet {
   leases: NativePoolLease[];
   nativeUsed: boolean;
   recover(index: number): Promise<Browser>;
+}
+
+/** Leaves a warm context in daemon-owned browsers for the next run. The child
+ * is detached and unref'd so it cannot delay this process's exit, and it takes
+ * its own lease rather than reusing these endpoints, which this process no
+ * longer owns. */
+function spawnWarmer(fleet: WorkerFleet, config: RunnerConfig): void {
+  if (!fleet.nativeUsed || process.env.RYZER_NO_WARM === "1") return;
+  const count = fleet.browsers.length;
+  if (count === 0) return;
+  try {
+    const entry = fileURLToPath(new URL("warm.js", import.meta.url));
+    const child = spawn(process.execPath, [entry, String(count), config.executablePath ?? ""], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.once("error", () => undefined);
+    child.unref();
+    trace("warmer:spawned", `${count} browser(s)`);
+  } catch {
+    // Warming is an optimization; failing to start it must never fail a run.
+  }
 }
 
 async function launchWorkers(count: number, config: RunnerConfig): Promise<WorkerFleet> {
@@ -296,6 +325,7 @@ async function executeTest(
   recoverBrowser?: () => Promise<Browser>,
   shouldPrepareNext?: () => boolean,
   observeCapsule = false,
+  allowWarmAdoption = false,
 ): Promise<{
   result: TestResult;
   reusable?: PreparedFixture;
@@ -314,7 +344,7 @@ async function executeTest(
     }
     let fixture: PreparedFixture;
     try {
-      fixture = reusable ?? (await prepareFixture(browser, config));
+      fixture = reusable ?? (await prepareFixture(browser, config, allowWarmAdoption));
     } catch (caught) {
       const error = formatError(caught);
       attempts.push({ attempt, durationMs: performance.now() - attemptStarted, error });
@@ -458,11 +488,22 @@ interface PreparedFixture {
   page: Awaited<ReturnType<Awaited<ReturnType<Browser["newContext"]>>["newPage"]>>;
 }
 
-async function prepareFixture(browser: Browser, config: RunnerConfig): Promise<PreparedFixture> {
+async function prepareFixture(
+  browser: Browser,
+  config: RunnerConfig,
+  allowWarmAdoption = false,
+): Promise<PreparedFixture> {
+  if (allowWarmAdoption && process.env.RYZER_NO_WARM !== "1") {
+    const adopted = await browser._adoptWarmContext(config);
+    if (adopted) {
+      trace("fixture:ready", "adopted");
+      return adopted;
+    }
+  }
   const context = await browser.newContext(config);
   try {
     const page = await context.newPage();
-    trace("fixture:ready");
+    trace("fixture:ready", "created");
     return { context, page };
   } catch (error) {
     await context.close();

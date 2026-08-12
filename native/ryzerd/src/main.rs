@@ -82,6 +82,29 @@ impl Pool {
         Ok(leases)
     }
 
+    /// Leases idle slots for the warmer, launching nothing and never waiting.
+    ///
+    /// Returns nothing at all while any lease is outstanding. A warm context is
+    /// worth having, but taking a browser that a live run is about to ask for
+    /// makes that run launch its own Chrome instead, and a machine already
+    /// running tests is the worst possible moment to add browser processes.
+    /// Requiring a fully idle pool keeps warming strictly off everyone's path.
+    fn acquire_free(&mut self, count: usize) -> Vec<(u64, String)> {
+        self.last_activity = Instant::now();
+        self.slots.retain_mut(|slot| slot.leased || slot.alive());
+        if self.has_leases() {
+            return Vec::new();
+        }
+        let mut leases = Vec::new();
+        for slot in &mut self.slots {
+            if !slot.leased && leases.len() < count {
+                slot.leased = true;
+                leases.push((slot.id, slot.ws_url.clone()));
+            }
+        }
+        leases
+    }
+
     fn release(&mut self, ids: &[u64]) {
         self.last_activity = Instant::now();
         for slot in &mut self.slots {
@@ -569,8 +592,9 @@ fn handle_client(mut stream: UnixStream, pool: Arc<Mutex<Pool>>) {
         let _ = writeln!(stream, "PONG\t{VERSION}");
         return;
     }
+    let free_only = line.starts_with("LEASEFREE\t");
     let count = match line
-        .strip_prefix("LEASE\t")
+        .strip_prefix(if free_only { "LEASEFREE\t" } else { "LEASE\t" })
         .and_then(|value| value.parse::<usize>().ok())
     {
         Some(value) if value > 0 && value <= 64 => value,
@@ -579,6 +603,34 @@ fn handle_client(mut stream: UnixStream, pool: Arc<Mutex<Pool>>) {
             return;
         }
     };
+    if free_only {
+        let leases = match pool.lock() {
+            Ok(mut value) => value.acquire_free(count),
+            Err(_) => return,
+        };
+        let payload = leases
+            .iter()
+            .map(|(id, url)| format!("{id}={url}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if writeln!(stream, "OK\t{payload}").is_err() {
+            if let Ok(mut pool) = pool.lock() {
+                pool.release(&leases.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+            }
+            return;
+        }
+        let mut buffer = [0u8; 64];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        if let Ok(mut pool) = pool.lock() {
+            pool.release(&leases.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+        }
+        return;
+    }
     let leases = {
         let mut pool = match pool.lock() {
             Ok(value) => value,

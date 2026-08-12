@@ -24,7 +24,7 @@ export interface ProjectFingerprint {
   files: Record<string, string>;
 }
 
-const PROTOCOL_VERSION = "7";
+const PROTOCOL_VERSION = "8";
 
 export async function fingerprintProject(
   root: string,
@@ -67,6 +67,10 @@ export async function fingerprintProject(
 export async function acquireNativePool(
   count: number,
   config: RunnerConfig,
+  /** Take only browsers that are already idle. The daemon launches nothing and
+   * may return fewer slots than asked for, including none. Used by the warmer,
+   * which must never make a real run wait for a browser or grow the pool. */
+  freeOnly = false,
 ): Promise<NativePoolLease | undefined> {
   if (!nativePoolCompatible(config)) return undefined;
   const binary = await nativeBinary();
@@ -103,7 +107,7 @@ export async function acquireNativePool(
   }
 
   try {
-    socket.write(`LEASE\t${count}\n`);
+    socket.write(`${freeOnly ? "LEASEFREE" : "LEASE"}\t${count}\n`);
     const response = await readLine(socket, timeoutMs);
     if (!response.startsWith("OK\t")) throw new Error(response.replace(/^ERR\t/, ""));
     const payload = response.slice(3);
@@ -119,8 +123,12 @@ export async function acquireNativePool(
         }
         return { id, wsUrl };
       });
-    if (slots.length !== count)
+    if (!freeOnly && slots.length !== count)
       throw new Error(`ryzerd returned ${slots.length} of ${count} requested slots`);
+    if (freeOnly && slots.length === 0) {
+      socket.destroy();
+      return undefined;
+    }
     let released = false;
     return {
       slots,
