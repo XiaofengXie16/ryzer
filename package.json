@@ -1,6 +1,6 @@
 {
   "name": "ryzer",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "A fast, deterministic browser test runner with a TypeScript-first API",
   "repository": {
     "type": "git",
