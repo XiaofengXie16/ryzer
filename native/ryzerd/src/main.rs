@@ -317,8 +317,14 @@ impl Sha256 {
             self.compress(&block);
             bytes = &bytes[64..];
         }
-        self.block[..bytes.len()].copy_from_slice(bytes);
-        self.block_len = bytes.len();
+        // Only overwrite the buffer when there is something left to buffer. An
+        // unconditional store discards bytes that the partial-block branch
+        // above just accumulated, which silently reduced every multi-update
+        // digest to a function of its length alone.
+        if !bytes.is_empty() {
+            self.block[..bytes.len()].copy_from_slice(bytes);
+            self.block_len = bytes.len();
+        }
     }
 
     fn finish(mut self) -> [u8; 32] {
@@ -619,4 +625,63 @@ fn launch_chrome(chrome: &Path, id: u64) -> Result<BrowserSlot, String> {
         profile,
         leased: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{digest_hex, Sha256};
+
+    fn hash(chunks: &[&[u8]]) -> String {
+        let mut hash = Sha256::new();
+        for chunk in chunks {
+            hash.update(chunk);
+        }
+        digest_hex(hash.finish())
+    }
+
+    #[test]
+    fn matches_known_vectors_in_one_update() {
+        assert_eq!(
+            hash(&[b""]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hash(&[b"abc"]),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// A partial block followed by more data must not lose the buffered bytes.
+    /// This is the shape `hash_symlink` uses, and getting it wrong made every
+    /// same-length symlink target collide.
+    #[test]
+    fn split_updates_match_a_single_update() {
+        let message = b"symlink\0/nonexistent";
+        let whole = hash(&[message]);
+        for split in 0..message.len() {
+            let (left, right) = message.split_at(split);
+            assert_eq!(hash(&[left, right]), whole, "split at {split}");
+        }
+        assert_eq!(
+            whole,
+            "8190a2f3ba2a33c408fb08e930ee5201c4313cd5c2e322a7928dc30838179835"
+        );
+    }
+
+    #[test]
+    fn many_small_updates_match_one_large_update() {
+        let message: Vec<u8> = (0..500u32).map(|index| (index % 251) as u8).collect();
+        let whole = hash(&[&message]);
+        let chunked: Vec<&[u8]> = message.chunks(7).collect();
+        assert_eq!(hash(&chunked), whole);
+    }
+
+    /// Distinct targets of equal length must produce distinct digests.
+    #[test]
+    fn equal_length_messages_do_not_collide() {
+        assert_ne!(
+            hash(&[b"symlink\0", b"/nonexistent"]),
+            hash(&[b"symlink\0", b"/XXXXXXXXXXX"])
+        );
+    }
 }

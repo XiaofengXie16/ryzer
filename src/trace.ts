@@ -10,3 +10,11 @@ export function trace(phase: string, detail?: string): void {
 }
 
 export const tracing = enabled;
+
+if (enabled) {
+  process.on("exit", () => {
+    process.stderr.write(
+      `[ryzer ${(performance.now() - origin).toFixed(1).padStart(8)}ms] process:exit\n`,
+    );
+  });
+}

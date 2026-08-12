@@ -9,7 +9,10 @@ import { fingerprintProject, type ProjectFingerprint } from "./native.js";
 import type { RegisteredTest } from "./test.js";
 import type { RunnerConfig } from "./types.js";
 
-const CACHE_VERSION = 3;
+// 4: symlink digests written by versions before the Sha256::update fix were a
+// function of the target's length alone, so a same-length retarget could not
+// invalidate a cached result.
+const CACHE_VERSION = 4;
 
 interface CachedTest {
   file: string;
