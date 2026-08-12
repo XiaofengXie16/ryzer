@@ -3,12 +3,10 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { enableCompileCache, importTypeScript } from "./loader.js";
+import { importTypeScript } from "./loader.js";
 import { runTests } from "./runner.js";
 import type { RunnerConfig } from "./types.js";
 import { packageVersion } from "./version.js";
-
-enableCompileCache();
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);

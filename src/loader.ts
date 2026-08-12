@@ -75,19 +75,6 @@ function mapToSource(specifier: string, parentURL?: string): string | undefined 
   return undefined;
 }
 
-/** V8 bytecode caching across CLI invocations. Node compiles the runner graph
- * and every stripped test file on each run; the cache removes that repeatedly. */
-export function enableCompileCache(): void {
-  const enable = (module as unknown as { enableCompileCache?: () => unknown }).enableCompileCache;
-  if (typeof enable === "function") {
-    try {
-      enable();
-    } catch {
-      // A read-only or full cache directory must never fail a test run.
-    }
-  }
-}
-
 /** Imports a TypeScript (or JavaScript) module, preferring Node's built-in type
  * stripping and falling back to tsx only for syntax Node cannot strip. */
 export async function importTypeScript(url: string): Promise<unknown> {

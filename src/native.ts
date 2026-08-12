@@ -83,7 +83,10 @@ export async function acquireNativePool(
   try {
     socket = await connect(socketPath, 100).catch(() => undefined);
     if (!socket) {
-      const idleSeconds = process.env.RYZER_DAEMON_IDLE_SECONDS ?? "600";
+      // Keeping warm Chromes for an hour rather than ten minutes means an
+      // ordinary interruption does not cost the next run a cold launch per
+      // worker (~250ms for one slot, ~490ms for four).
+      const idleSeconds = process.env.RYZER_DAEMON_IDLE_SECONDS ?? "3600";
       const child = spawn(
         binary,
         ["--socket", socketPath, "--chrome", chrome, "--idle-seconds", idleSeconds],

@@ -464,7 +464,12 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let mut socket_path: Option<PathBuf> = None;
     let mut chrome_path: Option<PathBuf> = None;
-    let mut idle_seconds = 600u64;
+    // A daemon that exits during a coffee break costs the next run a full cold
+    // Chrome launch per worker, measured at roughly 250ms for one slot and
+    // 490ms for four. The parked processes are the same ones the previous run
+    // already held, so a longer window changes how long they persist, not peak
+    // memory. Override with --idle-seconds or RYZER_DAEMON_IDLE_SECONDS.
+    let mut idle_seconds = 3_600u64;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => socket_path = args.next().map(PathBuf::from),
