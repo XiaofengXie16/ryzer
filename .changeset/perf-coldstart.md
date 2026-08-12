@@ -2,6 +2,8 @@
 "ryzer": patch
 ---
 
+Pay Chrome's renderer fork between runs instead of during them. The fork is ~185ms and was the largest single item in a warm run; it cannot be overlapped with test execution because Chrome serializes it against the browser it belongs to. A detached warmer now leaves one context per browser with its renderer already forked, and the next run adopts it in milliseconds. The warmer holds a real lease that the daemon grants only when the pool is fully idle, so it never delays a run or grows the pool.
+
 Load TypeScript test files through Node's own type stripper instead of esbuild. The previous fast-lane check rejected any file containing a relative import, which excluded essentially every real spec file; a resolve hook now maps `./foo.js` onto `./foo.ts` so only non-erasable syntax falls back to `tsx`. Measured 296ms to 33ms for twelve spec files importing shared helpers.
 
 Fix a bug in the native SHA-256 that discarded buffered bytes between `update` calls. Symlink digests were a function of the target's length alone, so repointing a symlink at a same-length path could not invalidate an `--incremental` cache, and the native and JavaScript fingerprint engines disagreed on every symlink. `CACHE_VERSION` moves to 4 so caches holding the old digests are discarded.
